@@ -1,0 +1,45 @@
+import os
+from twilio.rest import Client
+
+# Read credentials from environment variables
+account_sid = os.environ["TWILIO_ACCOUNT_SID"]
+auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+
+# Create Twilio client
+client = Client(account_sid, auth_token)
+
+try:
+    message = client.messages.create(
+        to=os.environ["ALERT_PHONE"],
+        from_=os.environ["TWILIO_PHONE_NUMBER"],
+        body="sms_internal_alerts"
+    )
+
+    print("SMS ALERT SENT SUCCESSFULLY")
+    print("Message SID:", message.sid)
+
+except Exception as e:
+    print("SMS ALERT FAILED:")
+    print(e)import os
+from twilio.rest import Client
+
+# Read credentials from environment variables
+account_sid = os.environ["TWILIO_ACCOUNT_SID"]
+auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+
+# Create Twilio client
+client = Client(account_sid, auth_token)
+
+try:
+    message = client.messages.create(
+        to=os.environ["ALERT_PHONE"],
+        from_=os.environ["TWILIO_PHONE_NUMBER"],
+        body="sms_internal_alerts"
+    )
+
+    print("SMS ALERT SENT SUCCESSFULLY")
+    print("Message SID:", message.sid)
+
+except Exception as e:
+    print("SMS ALERT FAILED:")
+    print(e)

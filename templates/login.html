@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Login — Anomaly Detection</title>
+  <style>
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { background:#0A0E1A; color:#fff; font-family:'Segoe UI',sans-serif;
+      display:flex; align-items:center; justify-content:center; min-height:100vh; }
+    .box { background:#131C30; border:1px solid #1E3050; border-radius:16px;
+      padding:40px; width:380px; }
+    .logo { text-align:center; font-size:3rem; margin-bottom:10px; }
+    h2 { text-align:center; font-size:1.3rem; margin-bottom:6px; color:#fff; }
+    .sub { text-align:center; color:#6B7A99; font-size:.82rem; margin-bottom:28px; }
+    label { display:block; font-size:.8rem; color:#B0BAC8; margin-bottom:5px; margin-top:16px; }
+    input { width:100%; padding:11px 14px; background:#0F1729; border:1px solid #1E3050;
+      border-radius:8px; color:#fff; font-size:.9rem; }
+    input:focus { outline:none; border-color:#1E78C8; }
+    select { width:100%; padding:11px 14px; background:#0F1729; border:1px solid #1E3050;
+      border-radius:8px; color:#fff; font-size:.9rem; margin-top:0; }
+    .btn { width:100%; padding:12px; background:#1E78C8; color:#fff; border:none;
+      border-radius:8px; font-size:1rem; font-weight:700; margin-top:24px; cursor:pointer; }
+    .btn:hover { background:#2a8fe0; }
+    .error { background:rgba(226,75,74,.15); border:1px solid #E24B4A; color:#E24B4A;
+      padding:10px 14px; border-radius:8px; font-size:.84rem; margin-bottom:16px; text-align:center; }
+    .info { text-align:center; margin-top:20px; font-size:.75rem; color:#6B7A99; }
+    .dashboard-link { display:block; text-align:center; margin-top:14px;
+      color:#14B8A6; font-size:.82rem; text-decoration:none; }
+  </style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">🛡️</div>
+  <h2>Login Anomaly Detection</h2>
+  <p class="sub">Sign in to your account</p>
+
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+
+  <form method="POST">
+    <label>Username</label>
+    <input type="text" name="username" placeholder="Enter username" required/>
+
+    <label>Password</label>
+    <input type="password" name="password" placeholder="Enter password" required/>
+
+    <label>Location</label>
+    <select name="location">
+      <option value="Chennai">Chennai</option>
+      <option value="Mumbai">Mumbai</option>
+      <option value="Delhi">Delhi</option>
+      <option value="Bangalore">Bangalore</option>
+      <option value="Unknown">Unknown</option>
+      <option value="Moscow">Moscow (Test Anomaly)</option>
+      <option value="Beijing">Beijing (Test Anomaly)</option>
+    </select>
+
+    <button type="submit" class="btn">Sign In</button>
+  </form>
+
+  <div class="info">
+    Test users: admin/admin123 · alice/alice123 · bob/bob123
+  </div>
+  <a href="/dashboard" class="dashboard-link">→ Open Security Dashboard</a>
+</div>
+</body>
+</html>
