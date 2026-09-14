@@ -2,5 +2,11 @@
 __pycache__/
 *.pyc
 .env
+.env.*
 database.db
+*.log
+sms_demo.log
 reports/
+instance/
+.vscode/
+.idea/

@@ -1,0 +1,641 @@
+import os
+from alert_engine import send_security_alert
+from dotenv import load_dotenv
+
+load_dotenv()
+from datetime import datetime, timedelta
+
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    session,
+    jsonify,
+    render_template,
+    send_file,
+)
+
+from flask_sqlalchemy import SQLAlchemy
+
+from models import db, LoginEvent
+from anomaly_engine import detect_anomalies
+
+# Your alert_engine.py must contain this function.
+# If the import fails, the application will still run without alerts.
+try:
+    from alert_engine import send_security_alert
+    ALERT_ENGINE_AVAILABLE = True
+except ImportError:
+    ALERT_ENGINE_AVAILABLE = False
+
+    def send_security_alert(event):
+        print("Alert engine is not available.")
+
+
+# --------------------------------------------------
+# Flask configuration
+# --------------------------------------------------
+
+app = Flask(__name__)
+
+app.secret_key = os.getenv(
+    "SECRET_KEY",
+    "change-this-secret-key-for-production"
+)
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Render/Supabase PostgreSQL connection
+# Local fallback: SQLite database.db
+database_url = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///database.db"
+)
+
+# Some PostgreSQL providers return postgres:// URLs.
+# SQLAlchemy requires postgresql://.
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace(
+        "postgres://",
+        "postgresql://",
+        1
+    )
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+
+db.init_app(app)
+
+
+# --------------------------------------------------
+# Demo users
+# Replace these only for your college demonstration.
+# --------------------------------------------------
+
+VALID_USERS = {
+    "admin": "admin123",
+    "alice": "alice123",
+    "bob": "bob123",
+}
+
+# Tracks failed attempts during the current application session.
+failed_tracker = {}
+
+
+# --------------------------------------------------
+# Helper functions
+# --------------------------------------------------
+
+def get_client_ip():
+    """
+    Get the visitor IP address.
+
+    When deployed behind a proxy, X-Forwarded-For may contain
+    the original client IP. For a college demo, this is enough.
+    """
+    forwarded_for = request.headers.get("X-Forwarded-For")
+
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    return request.remote_addr or "127.0.0.1"
+
+
+def get_device_details():
+    """
+    Collect basic browser/device information.
+    """
+    user_agent = request.headers.get("User-Agent", "Unknown")
+
+    if "Mobile" in user_agent:
+        device_type = "Mobile"
+    elif "Windows" in user_agent:
+        device_type = "Windows"
+    elif "Macintosh" in user_agent:
+        device_type = "Mac"
+    elif "Linux" in user_agent:
+        device_type = "Linux"
+    else:
+        device_type = "Unknown"
+
+    if "Chrome" in user_agent:
+        browser = "Chrome"
+    elif "Firefox" in user_agent:
+        browser = "Firefox"
+    elif "Safari" in user_agent:
+        browser = "Safari"
+    elif "Edge" in user_agent:
+        browser = "Edge"
+    else:
+        browser = "Unknown Browser"
+
+    return f"{browser}/{device_type}"
+
+
+def get_location():
+    """
+    Location is collected from the form for the college demo.
+
+    Do not trust this value in a real security system because
+    a user can modify it.
+    """
+    return request.form.get("location", "Chennai").strip() or "Unknown"
+
+
+def create_event(
+    username,
+    ip_address,
+    location,
+    device,
+    login_success,
+    failed_attempts,
+    result,
+):
+    """
+    Create and save a LoginEvent record.
+    """
+    event = LoginEvent(
+        username=username,
+        ip_address=ip_address,
+        location=location,
+        device=device,
+        timestamp=datetime.utcnow(),
+        login_success=login_success,
+        failed_attempts=failed_attempts,
+        is_anomalous=result["is_anomalous"],
+        risk_level=result["risk_level"],
+        risk_score=result["score"],
+        anomaly_types=",".join(result["anomalies"]),
+        explanation=result["explanation"],
+    )
+
+    db.session.add(event)
+    db.session.commit()
+
+    return event
+
+
+def send_alert_if_required(event):
+    """
+    Send an email/SMS alert only for High or Critical events.
+    """
+    if not ALERT_ENGINE_AVAILABLE:
+        print("Alert engine is not connected.")
+        return
+
+    if event.risk_level not in ["High", "Critical"]:
+        return
+
+    try:
+        send_security_alert(event)
+        print(
+            f"Security alert sent/triggered for event ID {event.id}"
+        )
+    except Exception as error:
+        # Alert failure should not crash the login application.
+        print(f"Alert sending failed: {error}")
+
+
+def event_to_dict(event):
+    """
+    Convert a LoginEvent object into JSON-compatible data.
+    """
+    return {
+        "id": event.id,
+        "username": event.username,
+        "ip_address": event.ip_address,
+        "location": event.location,
+        "device": event.device,
+        "timestamp": (
+            event.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            if event.timestamp
+            else ""
+        ),
+        "login_success": event.login_success,
+        "failed_attempts": event.failed_attempts,
+        "is_anomalous": event.is_anomalous,
+        "risk_level": event.risk_level,
+        "risk_score": event.risk_score,
+        "anomaly_types": (
+            event.anomaly_types.split(",")
+            if event.anomaly_types
+            else []
+        ),
+        "explanation": event.explanation,
+    }
+
+
+# --------------------------------------------------
+# Database initialization
+# --------------------------------------------------
+
+with app.app_context():
+    db.create_all()
+
+
+# --------------------------------------------------
+# Main routes
+# --------------------------------------------------
+
+@app.route("/")
+def index():
+    if session.get("logged_in"):
+        return redirect(url_for("dashboard"))
+
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template("login.html")
+
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    location = get_location()
+
+    ip_address = get_client_ip()
+    device = get_device_details()
+
+    if not username:
+        return render_template(
+            "login.html",
+            error="Username is required."
+        )
+
+    # Track failed attempts for each username.
+    previous_failed_attempts = failed_tracker.get(username, 0)
+
+    credentials_correct = (
+        VALID_USERS.get(username) == password
+    )
+
+    if credentials_correct:
+        # Reset failed attempts after a successful login.
+        failed_attempts = previous_failed_attempts
+        failed_tracker[username] = 0
+        login_success = True
+    else:
+        failed_attempts = previous_failed_attempts + 1
+        failed_tracker[username] = failed_attempts
+        login_success = False
+
+    # --------------------------------------------------
+    # Safe login rule
+    # --------------------------------------------------
+    # Correct credentials alone are not considered enough.
+    # Location must also be recognized.
+    #
+    # For stronger checking, anomaly_engine.py will still
+    # evaluate unknown devices, IP addresses and timing.
+    # --------------------------------------------------
+
+    if credentials_correct and location in [
+        "Chennai",
+        "Mumbai",
+        "Delhi",
+        "Bangalore",
+        "Hyderabad",
+        "localhost",
+        "local",
+    ]:
+        result = {
+            "anomalies": [],
+            "score": 0,
+            "risk_level": "Safe",
+            "is_anomalous": False,
+            "explanation": (
+                f"Login for '{username}' was successful. "
+                "Known credentials and recognized location."
+            ),
+        }
+    else:
+        result = detect_anomalies(
+            username=username,
+            ip_address=ip_address,
+            location=location,
+            device=device,
+            login_success=login_success,
+            failed_attempts=failed_attempts,
+            timestamp=datetime.utcnow(),
+        )
+
+    event = create_event(
+        username=username,
+        ip_address=ip_address,
+        location=location,
+        device=device,
+        login_success=login_success,
+        failed_attempts=failed_attempts,
+        result=result,
+    )
+
+    # Send email/SMS for high-risk activity.
+    send_alert_if_required(event)
+
+    if credentials_correct:
+        session["logged_in"] = True
+        session["username"] = username
+        session["last_login_event_id"] = event.id
+
+        return redirect(url_for("dashboard"))
+
+    return render_template(
+        "login.html",
+        error="Invalid username or password.",
+        risk_level=result["risk_level"],
+        explanation=result["explanation"],
+    )
+
+
+@app.route("/dashboard")
+def dashboard():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    return render_template(
+        "dashboard.html",
+        username=session.get("username", "User"),
+        alert_engine_available=ALERT_ENGINE_AVAILABLE,
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# --------------------------------------------------
+# API routes
+# --------------------------------------------------
+
+@app.route("/api/events")
+def api_events():
+    if not session.get("logged_in"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    events = (
+        LoginEvent.query
+        .order_by(LoginEvent.timestamp.desc())
+        .limit(100)
+        .all()
+    )
+
+    return jsonify([
+        event_to_dict(event)
+        for event in events
+    ])
+
+
+@app.route("/api/stats")
+def api_stats():
+    if not session.get("logged_in"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    total = LoginEvent.query.count()
+
+    successful = LoginEvent.query.filter_by(
+        login_success=True
+    ).count()
+
+    failed = LoginEvent.query.filter_by(
+        login_success=False
+    ).count()
+
+    flagged = LoginEvent.query.filter_by(
+        is_anomalous=True
+    ).count()
+
+    safe = LoginEvent.query.filter_by(
+        risk_level="Safe"
+    ).count()
+
+    low = LoginEvent.query.filter_by(
+        risk_level="Low"
+    ).count()
+
+    medium = LoginEvent.query.filter_by(
+        risk_level="Medium"
+    ).count()
+
+    high = LoginEvent.query.filter_by(
+        risk_level="High"
+    ).count()
+
+    critical = LoginEvent.query.filter_by(
+        risk_level="Critical"
+    ).count()
+
+    return jsonify({
+        "total": total,
+        "successful": successful,
+        "failed": failed,
+        "flagged": flagged,
+        "safe": safe,
+        "low": low,
+        "medium": medium,
+        "high": high,
+        "critical": critical,
+        "by_risk": {
+            "Safe": safe,
+            "Low": low,
+            "Medium": medium,
+            "High": high,
+            "Critical": critical,
+        },
+    })
+
+
+@app.route("/api/live")
+def api_live():
+    if not session.get("logged_in"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    one_minute_ago = datetime.utcnow() - timedelta(
+        seconds=60
+    )
+
+    events = (
+        LoginEvent.query
+        .filter(LoginEvent.timestamp >= one_minute_ago)
+        .order_by(LoginEvent.timestamp.desc())
+        .limit(60)
+        .all()
+    )
+
+    return jsonify([
+        event_to_dict(event)
+        for event in events
+    ])
+
+
+@app.route("/api/inject", methods=["POST"])
+def api_inject():
+    """
+    Insert a demo login event without using the login page.
+
+    Example JSON:
+    {
+        "username": "attacker",
+        "ip_address": "8.8.8.8",
+        "location": "Unknown City",
+        "device": "Unknown Device",
+        "login_success": false,
+        "failed_attempts": 5
+    }
+    """
+    if not session.get("logged_in"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username", "demo_user")
+    ip_address = data.get("ip_address", "8.8.8.8")
+    location = data.get("location", "Unknown City")
+    device = data.get("device", "Unknown Device")
+    login_success = bool(data.get("login_success", False))
+    failed_attempts = int(data.get("failed_attempts", 5))
+
+    result = detect_anomalies(
+        username=username,
+        ip_address=ip_address,
+        location=location,
+        device=device,
+        login_success=login_success,
+        failed_attempts=failed_attempts,
+        timestamp=datetime.utcnow(),
+    )
+
+    event = create_event(
+        username=username,
+        ip_address=ip_address,
+        location=location,
+        device=device,
+        login_success=login_success,
+        failed_attempts=failed_attempts,
+        result=result,
+    )
+
+    send_alert_if_required(event)
+
+    return jsonify({
+        "message": "Demo event inserted successfully.",
+        "event": event_to_dict(event),
+    }), 201
+
+
+@app.route("/api/clear", methods=["POST"])
+def api_clear():
+    if not session.get("logged_in"):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
+    LoginEvent.query.delete()
+    db.session.commit()
+
+    failed_tracker.clear()
+
+    return jsonify({
+        "message": "All login events cleared."
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "database": "configured",
+        "alert_engine": (
+            "available"
+            if ALERT_ENGINE_AVAILABLE
+            else "unavailable"
+        ),
+    })
+
+
+# --------------------------------------------------
+# Ten-day PDF report
+# --------------------------------------------------
+
+@app.route("/generate-10-day-report")
+def generate_10_day_report_route():
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+
+    try:
+        from report_generator import generate_10_day_report
+    except ImportError:
+        return (
+            "report_generator.py is missing or ReportLab is not installed.",
+            500,
+        )
+
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=10)
+
+    events = (
+        LoginEvent.query
+        .filter(
+            LoginEvent.timestamp >= start_date,
+            LoginEvent.timestamp <= end_date
+        )
+        .order_by(LoginEvent.timestamp.desc())
+        .all()
+    )
+
+    reports_folder = os.path.join(
+        app.root_path,
+        "reports"
+    )
+
+    os.makedirs(
+        reports_folder,
+        exist_ok=True
+    )
+
+    filename = (
+        "login_security_report_"
+        + datetime.now().strftime("%Y%m%d_%H%M%S")
+        + ".pdf"
+    )
+
+    filepath = os.path.join(
+        reports_folder,
+        filename
+    )
+
+    generate_10_day_report(
+        events=events,
+        output_path=filepath
+    )
+
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf",
+    )
+
+
+# --------------------------------------------------
+# Application start
+# --------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+    )
