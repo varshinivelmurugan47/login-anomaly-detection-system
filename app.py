@@ -1,295 +1,805 @@
+# ============================================================
+# app.py — Real-Time Login Anomaly Detection System
+# ============================================================
+
 import os
-from datetime import datetime, timedelta
+import logging
+
+from datetime import datetime, timedelta, timezone
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 from flask import (
     Flask,
-    render_template,
     request,
-    jsonify,
     redirect,
     url_for,
     session,
+    jsonify,
+    render_template,
     send_file
 )
 
-from models import db, LoginEvent
-from anomaly_engine import detect_anomalies
-from alert_engine import send_security_alert
-from report_generator import generate_10_day_report
 
-
-# =========================================================
-# FLASK APPLICATION
-# =========================================================
-
-app = Flask(__name__)
-
-app.config["SECRET_KEY"] = os.getenv(
-    "FLASK_SECRET_KEY",
-    "demo-secret-key-change-this"
+from models import (
+    db,
+    LoginEvent,
+    TrustedDevice
 )
 
-# =========================================================
-# DATABASE CONFIGURATION
-# =========================================================
+
+from anomaly_engine import (
+    detect_anomalies
+)
+
+
+# ============================================================
+# ALERT ENGINE
+# ============================================================
+
+try:
+
+    from alert_engine import (
+        send_security_alert
+    )
+
+    ALERT_ENGINE_AVAILABLE = True
+
+
+except ImportError as error:
+
+    ALERT_ENGINE_AVAILABLE = False
+
+    print("=" * 60)
+
+    print(
+        "ALERT ENGINE NOT AVAILABLE"
+    )
+
+    print(
+        f"Reason: {error}"
+    )
+
+    print("=" * 60)
+
+
+    def send_security_alert(event):
+
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO
+)
+
+
+logger = logging.getLogger(
+    __name__
+)
+
+
+# ============================================================
+# FLASK APPLICATION
+# ============================================================
+
+app = Flask(
+    __name__
+)
+
+
+app.secret_key = os.getenv(
+    "SECRET_KEY",
+    "change-this-secret-key-for-production"
+)
+
+
+app.config[
+    "SQLALCHEMY_TRACK_MODIFICATIONS"
+] = False
+
 
 database_url = os.getenv(
     "DATABASE_URL",
     "sqlite:///database.db"
 )
 
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 
-# Render/PostgreSQL sometimes gives postgres://
-if database_url.startswith("postgres://"):
+if database_url.startswith(
+    "postgres://"
+):
+
     database_url = database_url.replace(
         "postgres://",
         "postgresql://",
         1
     )
 
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-db.init_app(app)
+app.config[
+    "SQLALCHEMY_DATABASE_URI"
+] = database_url
 
 
-# =========================================================
+db.init_app(
+    app
+)
+
+
+# ============================================================
 # DEMO USERS
-# =========================================================
+# ============================================================
 
 VALID_USERS = {
+
     "admin": "admin123",
+
     "alice": "alice123",
-    "bob": "bob123"
+
+    "bob": "bob123",
+
+    "varshini": "varshini123"
 }
 
 
-# =========================================================
+# ============================================================
 # FAILED LOGIN TRACKER
-# =========================================================
+# ============================================================
 
 failed_tracker = {}
 
 
-# =========================================================
-# KNOWN LOCATIONS
-# =========================================================
+# ============================================================
+# NORMAL LOGIN HOURS
+# ============================================================
 
-KNOWN_LOCATIONS = {
-    "Chennai",
-    "Mumbai",
-    "Delhi",
-    "Bangalore",
-    "Hyderabad",
-    "localhost",
-    "local"
-}
+NORMAL_LOGIN_START = 8
+
+NORMAL_LOGIN_END = 22
 
 
-# =========================================================
+# ============================================================
 # DATABASE INITIALIZATION
-# =========================================================
+# ============================================================
 
 with app.app_context():
+
     db.create_all()
 
+    logger.info(
+        "Database ready."
+    )
 
-# =========================================================
-# DEVICE DETECTION
-# =========================================================
 
-def detect_device(user_agent):
+# ============================================================
+# UTC TIME
+# ============================================================
 
-    user_agent = user_agent.lower()
+def utc_now():
 
-    if "android" in user_agent:
+    return datetime.now(
+        timezone.utc
+    )
+
+
+# ============================================================
+# CLIENT IP
+# ============================================================
+
+def get_client_ip():
+
+    forwarded_for = request.headers.get(
+        "X-Forwarded-For"
+    )
+
+
+    if forwarded_for:
+
+        return (
+            forwarded_for
+            .split(",")[0]
+            .strip()
+        )
+
+
+    return (
+        request.remote_addr
+        or
+        "Unknown"
+    )
+
+
+# ============================================================
+# USER AGENT
+# ============================================================
+
+def get_user_agent():
+
+    return request.headers.get(
+        "User-Agent",
+        "Unknown"
+    )
+
+
+# ============================================================
+# DEVICE TYPE
+# ============================================================
+
+def get_device_type(
+    user_agent
+):
+
+    ua = (
+        user_agent
+        or ""
+    ).lower()
+
+
+    # --------------------------------------------------------
+    # Android
+    # --------------------------------------------------------
+
+    if "android" in ua:
+
         return "Mobile/Android"
 
-    if "iphone" in user_agent or "ipad" in user_agent:
+
+    # --------------------------------------------------------
+    # iPhone / iPad
+    # --------------------------------------------------------
+
+    if (
+        "iphone" in ua
+        or
+        "ipad" in ua
+    ):
+
         return "Mobile/iOS"
 
-    if "windows" in user_agent:
+
+    # --------------------------------------------------------
+    # Windows
+    # --------------------------------------------------------
+
+    if "windows" in ua:
+
         return "Chrome/Windows"
 
-    if "macintosh" in user_agent:
+
+    # --------------------------------------------------------
+    # Mac
+    # --------------------------------------------------------
+
+    if (
+        "macintosh" in ua
+        or
+        "mac os" in ua
+    ):
+
         return "Safari/Mac"
 
-    if "linux" in user_agent:
+
+    # --------------------------------------------------------
+    # Linux
+    # --------------------------------------------------------
+
+    if "linux" in ua:
+
         return "Firefox/Linux"
+
 
     return "Unknown"
 
 
-# =========================================================
-# LOGIN PAGE
-# =========================================================
+# ============================================================
+# DEVICE DETAILS
+# ============================================================
 
-@app.route("/")
-def index():
+def get_device_details():
 
-    if session.get("logged_in"):
-        return redirect(url_for("dashboard"))
+    user_agent = get_user_agent()
 
-    return redirect(url_for("login"))
-
-
-# =========================================================
-# LOGIN
-# =========================================================
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-
-    if request.method == "GET":
-
-        return render_template(
-            "login.html"
-        )
-
-    # -----------------------------------------------------
-    # GET LOGIN DATA
-    # -----------------------------------------------------
-
-    username = request.form.get(
-        "username",
-        ""
-    ).strip()
-
-    password = request.form.get(
-        "password",
-        ""
-    )
-
-    ip_address = request.remote_addr or "127.0.0.1"
-
-    user_agent = request.headers.get(
-        "User-Agent",
-        ""
-    )
-
-    device = detect_device(
+    return get_device_type(
         user_agent
     )
 
-    # -----------------------------------------------------
-    # DEMO LOCATION
-    # -----------------------------------------------------
 
-    # If your login page sends location,
-    # this value will be used.
-    #
-    # Otherwise Chennai is used for demo.
+# ============================================================
+# LOCATION
+# ============================================================
+
+def get_location():
 
     location = request.form.get(
         "location",
-        "Chennai"
+        ""
     ).strip()
 
+
     if not location:
-        location = "Chennai"
 
-    # -----------------------------------------------------
-    # CHECK CREDENTIALS
-    # -----------------------------------------------------
+        location = request.args.get(
+            "location",
+            ""
+        ).strip()
 
-    credentials_correct = (
-        VALID_USERS.get(username) == password
+
+    if not location:
+
+        location = "Unknown"
+
+
+    return location
+
+
+# ============================================================
+# TRUSTED PROFILE
+# ============================================================
+
+def get_trusted_profile(
+    username
+):
+
+    return TrustedDevice.query.filter_by(
+        username=username
+    ).all()
+
+
+# ============================================================
+# TRUSTED DEVICE CHECK
+# ============================================================
+
+def check_trusted_device(
+    username,
+    device,
+    user_agent,
+    ip_address,
+    location
+):
+
+    exact_match = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        device=device,
+
+        ip_address=ip_address
+
+    ).first()
+
+
+    known_device = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        device=device
+
+    ).first()
+
+
+    known_ip = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        ip_address=ip_address
+
+    ).first()
+
+
+    known_location = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        location=location
+
+    ).first()
+
+
+    known_user_agent = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        user_agent=user_agent
+
+    ).first()
+
+
+    return {
+
+        "trusted_exact_match":
+            exact_match is not None,
+
+        "known_device":
+            known_device is not None,
+
+        "known_ip":
+            known_ip is not None,
+
+        "known_location":
+            known_location is not None,
+
+        "known_user_agent":
+            known_user_agent is not None
+    }
+
+
+# ============================================================
+# BEHAVIORAL RISK
+# ============================================================
+
+def calculate_behavioral_risk(
+    username,
+    device,
+    user_agent,
+    ip_address,
+    location,
+    login_time=None
+):
+
+    if login_time is None:
+
+        login_time = datetime.now()
+
+
+    profile = check_trusted_device(
+
+        username=username,
+
+        device=device,
+
+        user_agent=user_agent,
+
+        ip_address=ip_address,
+
+        location=location
     )
 
-    # -----------------------------------------------------
-    # FAILED ATTEMPT COUNT
-    # -----------------------------------------------------
 
-    if username not in failed_tracker:
-        failed_tracker[username] = 0
+    # ========================================================
+    # FIRST LOGIN / NO PROFILE
+    # ========================================================
 
-    if not credentials_correct:
+    existing_profile = TrustedDevice.query.filter_by(
+        username=username
+    ).first()
 
-        failed_tracker[username] += 1
+
+    if existing_profile is None:
+
+        return {
+
+            "score": 0,
+
+            "risk_level": "Safe",
+
+            "explanation": (
+                "First successful login for this user. "
+                "Device and login behaviour will be "
+                "registered as the initial trusted profile."
+            ),
+
+            "known_device": False,
+
+            "known_ip": False,
+
+            "known_location": False,
+
+            "trusted_exact_match": False,
+
+            "first_login": True
+        }
+
+
+    score = 0
+
+    reasons = []
+
+
+    # ========================================================
+    # EXACT TRUSTED DEVICE
+    # ========================================================
+
+    if profile[
+        "trusted_exact_match"
+    ]:
+
+        reasons.append(
+            "Known trusted device and IP"
+        )
+
+
+    # ========================================================
+    # NEW DEVICE
+    # ========================================================
+
+    if not profile[
+        "known_device"
+    ]:
+
+        score += 35
+
+        reasons.append(
+            "New device detected"
+        )
+
 
     else:
 
-        # Successful login resets failed attempts
-        failed_tracker[username] = 0
+        reasons.append(
+            "Known device detected"
+        )
 
-    failed_attempts = failed_tracker[username]
 
-    # -----------------------------------------------------
-    # CURRENT TIME
-    # -----------------------------------------------------
+    # ========================================================
+    # NEW USER AGENT
+    # ========================================================
 
-    timestamp = datetime.utcnow()
+    if not profile[
+        "known_user_agent"
+    ]:
 
-    # =====================================================
-    # SAFE LOGIN RULE
-    # =====================================================
+        score += 10
 
-    # Correct credentials + known location
-    # will normally be considered Safe.
-    #
-    # Other events go through anomaly detection.
+        reasons.append(
+            "New browser/device fingerprint detected"
+        )
 
-    location_safe = (
-        location in KNOWN_LOCATIONS
+
+    # ========================================================
+    # NEW IP
+    # ========================================================
+
+    if not profile[
+        "known_ip"
+    ]:
+
+        score += 25
+
+        reasons.append(
+            "New IP address detected"
+        )
+
+
+    else:
+
+        reasons.append(
+            "Known IP address detected"
+        )
+
+
+    # ========================================================
+    # NEW LOCATION
+    # ========================================================
+
+    if not profile[
+        "known_location"
+    ]:
+
+        score += 25
+
+        reasons.append(
+            "New location detected"
+        )
+
+
+    else:
+
+        reasons.append(
+            "Known location detected"
+        )
+
+
+    # ========================================================
+    # UNUSUAL LOGIN TIME
+    # ========================================================
+
+    hour = login_time.hour
+
+
+    if (
+        hour < NORMAL_LOGIN_START
+        or
+        hour >= NORMAL_LOGIN_END
+    ):
+
+        score += 20
+
+        reasons.append(
+            "Login outside normal hours"
+        )
+
+    else:
+
+        reasons.append(
+            "Login time is within normal hours"
+        )
+
+
+    score = min(
+        score,
+        100
     )
 
-    if credentials_correct and location_safe:
+
+    # ========================================================
+    # BEHAVIORAL RISK LEVEL
+    # ========================================================
+
+    if score == 0:
 
         risk_level = "Safe"
-        risk_score = 0
-        is_anomalous = False
-        anomalies = []
 
-        explanation = (
-            f"Login for '{username}' is normal. "
-            "Valid credentials and recognized location."
+    elif score <= 20:
+
+        risk_level = "Low"
+
+    elif score <= 45:
+
+        risk_level = "Medium"
+
+    elif score <= 70:
+
+        risk_level = "High"
+
+    else:
+
+        risk_level = "Critical"
+
+
+    explanation = "; ".join(
+        reasons
+    )
+
+
+    return {
+
+        "score": score,
+
+        "risk_level": risk_level,
+
+        "explanation": explanation,
+
+        "known_device":
+            profile["known_device"],
+
+        "known_ip":
+            profile["known_ip"],
+
+        "known_location":
+            profile["known_location"],
+
+        "trusted_exact_match":
+            profile["trusted_exact_match"],
+
+        "first_login": False
+    }
+
+
+# ============================================================
+# REGISTER TRUSTED DEVICE
+# ============================================================
+
+def register_trusted_device(
+    username,
+    device,
+    user_agent,
+    ip_address,
+    location
+):
+
+    existing = TrustedDevice.query.filter_by(
+
+        username=username,
+
+        device=device,
+
+        ip_address=ip_address
+
+    ).first()
+
+
+    now = utc_now()
+
+
+    if existing:
+
+        existing.last_seen = now
+
+        existing.login_count = (
+            existing.login_count or 0
+        ) + 1
+
+        existing.location = location
+
+        existing.user_agent = user_agent
+
+
+    else:
+
+        trusted = TrustedDevice(
+
+            username=username,
+
+            device=device,
+
+            user_agent=user_agent,
+
+            ip_address=ip_address,
+
+            location=location,
+
+            first_seen=now,
+
+            last_seen=now,
+
+            login_count=1
+        )
+
+
+        db.session.add(
+            trusted
+        )
+
+
+    db.session.commit()
+
+
+    logger.info(
+        "Trusted device updated for user: %s",
+        username
+    )
+
+
+# ============================================================
+# CREATE LOGIN EVENT
+# ============================================================
+
+def create_event(
+    username,
+    ip_address,
+    location,
+    device,
+    timestamp,
+    login_success,
+    failed_attempts,
+    is_anomalous,
+    risk_level,
+    risk_score,
+    explanation,
+    anomaly_types=None
+):
+
+    if anomaly_types is None:
+
+        anomaly_types = []
+
+
+    if isinstance(
+        anomaly_types,
+        list
+    ):
+
+        anomaly_types_string = ",".join(
+            anomaly_types
         )
 
     else:
 
-        # =================================================
-        # ANOMALY DETECTION
-        # =================================================
-
-        result = detect_anomalies(
-            username=username,
-            ip_address=ip_address,
-            location=location,
-            device=device,
-            login_success=credentials_correct,
-            failed_attempts=failed_attempts,
-            timestamp=timestamp
+        anomaly_types_string = str(
+            anomaly_types
         )
 
-        anomalies = result.get(
-            "anomalies",
-            []
-        )
-
-        risk_score = result.get(
-            "score",
-            0
-        )
-
-        risk_level = result.get(
-            "risk_level",
-            "Safe"
-        )
-
-        is_anomalous = result.get(
-            "is_anomalous",
-            False
-        )
-
-        explanation = result.get(
-            "explanation",
-            ""
-        )
-
-    # =====================================================
-    # DATABASE EVENT
-    # =====================================================
 
     event = LoginEvent(
 
@@ -303,7 +813,7 @@ def login():
 
         timestamp=timestamp,
 
-        login_success=credentials_correct,
+        login_success=login_success,
 
         failed_attempts=failed_attempts,
 
@@ -313,406 +823,1175 @@ def login():
 
         risk_score=risk_score,
 
-        anomaly_types=",".join(anomalies),
+        anomaly_types=anomaly_types_string,
 
         explanation=explanation
     )
 
-    db.session.add(event)
+
+    db.session.add(
+        event
+    )
 
     db.session.commit()
 
-    # =====================================================
-    # SECURITY ALERT
-    # =====================================================
 
-    alert_result = {
+    return event
 
-        "alert_triggered": False,
 
-        "email_sent": False,
+# ============================================================
+# SEND ALERT
+# ============================================================
 
-        "sms_sent": False
+def send_alert_if_required(
+    event
+):
 
-    }
+    if not ALERT_ENGINE_AVAILABLE:
 
-    # -----------------------------------------------------
-    # HIGH / CRITICAL ALERT
-    # -----------------------------------------------------
+        logger.warning(
+            "Alert engine unavailable."
+        )
 
-    if risk_level in [
-        "High",
-        "Critical"
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+    risk_level = str(
+        getattr(
+            event,
+            "risk_level",
+            "LOW"
+        )
+    ).strip().upper()
+
+
+    if risk_level not in [
+        "HIGH",
+        "CRITICAL"
     ]:
 
-        print("\n")
-        print("=" * 70)
-        print("🚨 HIGH RISK LOGIN DETECTED")
-        print("=" * 70)
-
-        print(
-            f"Username   : {username}"
+        logger.info(
+            "No security alert required. "
+            "Risk level: %s",
+            risk_level
         )
 
-        print(
-            f"IP Address : {ip_address}"
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+    try:
+
+        result = send_security_alert(
+            event
         )
 
-        print(
-            f"Location   : {location}"
+
+        logger.info(
+            "Security alert result: %s",
+            result
         )
 
-        print(
-            f"Risk Level : {risk_level}"
+
+        return result
+
+
+    except Exception as error:
+
+        logger.exception(
+            "Security alert failed: %s",
+            error
         )
 
-        print(
-            f"Risk Score : {risk_score}"
+
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+# ============================================================
+# EVENT → DICTIONARY
+# ============================================================
+
+def event_to_dict(
+    event
+):
+
+    anomaly_types = []
+
+    if getattr(
+        event,
+        "anomaly_types",
+        ""
+    ):
+
+        anomaly_types = [
+
+            x.strip()
+
+            for x in event.anomaly_types.split(",")
+
+            if x.strip()
+        ]
+
+
+    return {
+
+        "id":
+            getattr(
+                event,
+                "id",
+                None
+            ),
+
+        "username":
+            getattr(
+                event,
+                "username",
+                None
+            ),
+
+        "ip_address":
+            getattr(
+                event,
+                "ip_address",
+                None
+            ),
+
+        "location":
+            getattr(
+                event,
+                "location",
+                None
+            ),
+
+        "device":
+            getattr(
+                event,
+                "device",
+                None
+            ),
+
+        "timestamp":
+            (
+                event.timestamp.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                if getattr(
+                    event,
+                    "timestamp",
+                    None
+                )
+                else ""
+            ),
+
+        "login_success":
+            bool(
+                getattr(
+                    event,
+                    "login_success",
+                    False
+                )
+            ),
+
+        "failed_attempts":
+            getattr(
+                event,
+                "failed_attempts",
+                0
+            ) or 0,
+
+        "is_anomalous":
+            bool(
+                getattr(
+                    event,
+                    "is_anomalous",
+                    False
+                )
+            ),
+
+        "risk_level":
+            getattr(
+                event,
+                "risk_level",
+                "Unknown"
+            ),
+
+        "risk_score":
+            getattr(
+                event,
+                "risk_score",
+                0
+            ) or 0,
+
+        "anomaly_types":
+            anomaly_types,
+
+        "explanation":
+            getattr(
+                event,
+                "explanation",
+                ""
+            ) or ""
+    }
+
+
+# ============================================================
+# LOGIN ROUTE
+# ============================================================
+
+@app.route(
+    "/",
+    methods=["GET", "POST"]
+)
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
+def login():
+
+    if request.method == "GET":
+
+        return render_template(
+            "login.html"
         )
 
-        print(
-            f"Explanation: {explanation}"
+
+    username = request.form.get(
+        "username",
+        ""
+    ).strip()
+
+
+    password = request.form.get(
+        "password",
+        ""
+    )
+
+
+    ip_address = get_client_ip()
+
+    location = get_location()
+
+    device = get_device_details()
+
+    user_agent = get_user_agent()
+
+    timestamp = datetime.now()
+
+
+    # ========================================================
+    # FAILED LOGIN TRACKING
+    # ========================================================
+
+    tracker_key = (
+        f"{username}:{ip_address}"
+    )
+
+
+    failed_attempts = failed_tracker.get(
+        tracker_key,
+        0
+    )
+
+
+    credentials_valid = (
+
+        username in VALID_USERS
+
+        and
+
+        VALID_USERS[username] == password
+    )
+
+
+    # ========================================================
+    # INVALID CREDENTIALS
+    # ========================================================
+
+    if not credentials_valid:
+
+        failed_attempts += 1
+
+
+        failed_tracker[
+            tracker_key
+        ] = failed_attempts
+
+
+        anomaly_result = detect_anomalies(
+
+            username=username,
+
+            ip_address=ip_address,
+
+            location=location,
+
+            device=device,
+
+            login_success=False,
+
+            failed_attempts=failed_attempts,
+
+            timestamp=timestamp
         )
 
-        print("=" * 70)
 
-        # -------------------------------------------------
-        # SEND EMAIL + SMS
-        # -------------------------------------------------
+        risk_score = anomaly_result.get(
+            "risk_score",
+            anomaly_result.get(
+                "score",
+                0
+            )
+        )
 
-        try:
 
-            alert_result = send_security_alert(
+        risk_level = anomaly_result.get(
+            "risk_level",
+            "Medium"
+        )
 
-                username=username,
 
-                ip_address=ip_address,
+        explanation = anomaly_result.get(
+            "explanation",
+            "Invalid credentials detected."
+        )
 
-                location=location,
 
-                risk_level=risk_level,
+        anomaly_types = anomaly_result.get(
+            "anomalies",
+            []
+        )
 
-                risk_score=risk_score,
 
-                explanation=explanation
+        # Force escalating risk
+        if failed_attempts >= 5:
+
+            risk_level = "Critical"
+
+        elif failed_attempts >= 3:
+
+            risk_level = "High"
+
+
+        is_anomalous = True
+
+
+        event = create_event(
+
+            username=username,
+
+            ip_address=ip_address,
+
+            location=location,
+
+            device=device,
+
+            timestamp=timestamp,
+
+            login_success=False,
+
+            failed_attempts=failed_attempts,
+
+            is_anomalous=is_anomalous,
+
+            risk_level=risk_level,
+
+            risk_score=risk_score,
+
+            explanation=explanation,
+
+            anomaly_types=anomaly_types
+        )
+
+
+        alert_result = send_alert_if_required(
+            event
+        )
+
+
+        return render_template(
+
+            "login.html",
+
+            error=(
+                "Invalid username or password."
+            ),
+
+            risk_level=risk_level,
+
+            risk_score=risk_score,
+
+            explanation=explanation,
+
+            alert_result=alert_result
+        )
+
+
+    # ========================================================
+    # VALID CREDENTIALS
+    # ========================================================
+
+    failed_tracker[
+        tracker_key
+    ] = 0
+
+
+    # ========================================================
+    # BEHAVIORAL ANALYSIS
+    # ========================================================
+
+    behavioral_result = calculate_behavioral_risk(
+
+        username=username,
+
+        device=device,
+
+        user_agent=user_agent,
+
+        ip_address=ip_address,
+
+        location=location,
+
+        login_time=timestamp
+    )
+
+
+    behavioral_score = behavioral_result[
+        "score"
+    ]
+
+
+    behavioral_risk = behavioral_result[
+        "risk_level"
+    ]
+
+
+    behavioral_explanation = behavioral_result[
+        "explanation"
+    ]
+
+
+    # ========================================================
+    # EXISTING ANOMALY ENGINE
+    # ========================================================
+
+    anomaly_result = detect_anomalies(
+
+        username=username,
+
+        ip_address=ip_address,
+
+        location=location,
+
+        device=device,
+
+        login_success=True,
+
+        failed_attempts=0,
+
+        timestamp=timestamp
+    )
+
+
+    anomaly_score = anomaly_result.get(
+        "risk_score",
+        anomaly_result.get(
+            "score",
+            0
+        )
+    )
+
+
+    anomaly_level = anomaly_result.get(
+        "risk_level",
+        "Safe"
+    )
+
+
+    anomaly_explanation = anomaly_result.get(
+        "explanation",
+        ""
+    )
+
+
+    anomaly_types = anomaly_result.get(
+        "anomalies",
+        []
+    )
+
+
+    # ========================================================
+    # COMBINE SCORES
+    # ========================================================
+
+    final_score = max(
+        behavioral_score,
+        anomaly_score
+    )
+
+
+    # ========================================================
+    # RISK PRIORITY
+    # ========================================================
+
+    risk_priority = {
+
+        "SAFE": 0,
+
+        "LOW": 1,
+
+        "MEDIUM": 2,
+
+        "HIGH": 3,
+
+        "CRITICAL": 4
+    }
+
+
+    behavioral_rank = risk_priority.get(
+
+        str(
+            behavioral_risk
+        ).upper(),
+
+        0
+    )
+
+
+    anomaly_rank = risk_priority.get(
+
+        str(
+            anomaly_level
+        ).upper(),
+
+        0
+    )
+
+
+    if behavioral_rank >= anomaly_rank:
+
+        final_risk_level = behavioral_risk
+
+    else:
+
+        final_risk_level = anomaly_level
+
+
+    # ========================================================
+    # COMBINE EXPLANATIONS
+    # ========================================================
+
+    explanations = []
+
+
+    if behavioral_explanation:
+
+        explanations.append(
+            behavioral_explanation
+        )
+
+
+    if anomaly_explanation:
+
+        if anomaly_explanation not in explanations:
+
+            explanations.append(
+                anomaly_explanation
             )
 
-        except Exception as e:
 
-            print(
-                f"Alert engine error: {e}"
-            )
+    final_explanation = "; ".join(
+        explanations
+    )
 
-            alert_result = {
 
-                "alert_triggered": True,
+    # ========================================================
+    # FIRST LOGIN ENROLLMENT
+    # ========================================================
 
-                "email_sent": False,
+    first_login = behavioral_result.get(
+        "first_login",
+        False
+    )
 
-                "sms_sent": False,
 
-                "error": str(e)
+    if first_login and not anomaly_types:
 
-            }
+        final_score = 0
 
-    # =====================================================
-    # LOGIN SUCCESS
-    # =====================================================
+        final_risk_level = "Safe"
 
-    if credentials_correct:
+        final_explanation = (
 
-        session["logged_in"] = True
-
-        session["username"] = username
-
-        session["login_time"] = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
+            "First successful login detected. "
+            "The device, IP address, location and "
+            "browser fingerprint have been registered "
+            "as the initial trusted profile."
         )
 
-        # -----------------------------------------------
-        # SUCCESSFUL LOGIN
-        # -----------------------------------------------
+        anomaly_types = []
+
+
+    # ========================================================
+    # SAFE / LOW
+    # ========================================================
+
+    if final_risk_level.upper() in [
+        "SAFE",
+        "LOW"
+    ]:
+
+        is_anomalous = False
+
+
+        event = create_event(
+
+            username=username,
+
+            ip_address=ip_address,
+
+            location=location,
+
+            device=device,
+
+            timestamp=timestamp,
+
+            login_success=True,
+
+            failed_attempts=0,
+
+            is_anomalous=is_anomalous,
+
+            risk_level=final_risk_level,
+
+            risk_score=final_score,
+
+            explanation=final_explanation,
+
+            anomaly_types=anomaly_types
+        )
+
+
+        # ====================================================
+        # REGISTER TRUSTED DEVICE
+        # ====================================================
+
+        register_trusted_device(
+
+            username=username,
+
+            device=device,
+
+            user_agent=user_agent,
+
+            ip_address=ip_address,
+
+            location=location
+        )
+
+
+        session[
+            "logged_in"
+        ] = True
+
+
+        session[
+            "username"
+        ] = username
+
+
+        session[
+            "suspicious_login"
+        ] = False
+
+
+        logger.info(
+            "Successful trusted login: %s",
+            username
+        )
+
 
         return redirect(
-            url_for("dashboard")
+            url_for(
+                "dashboard"
+            )
         )
 
-    # =====================================================
-    # LOGIN FAILURE
-    # =====================================================
+
+    # ========================================================
+    # MEDIUM / HIGH / CRITICAL
+    # ========================================================
+
+    is_anomalous = True
+
+
+    event = create_event(
+
+        username=username,
+
+        ip_address=ip_address,
+
+        location=location,
+
+        device=device,
+
+        timestamp=timestamp,
+
+        login_success=True,
+
+        failed_attempts=0,
+
+        is_anomalous=is_anomalous,
+
+        risk_level=final_risk_level,
+
+        risk_score=final_score,
+
+        explanation=final_explanation,
+
+        anomaly_types=anomaly_types
+    )
+
+
+    # ========================================================
+    # HIGH / CRITICAL ALERT
+    # ========================================================
+
+    alert_result = send_alert_if_required(
+        event
+    )
+
+
+    # ========================================================
+    # DEMO SESSION
+    # ========================================================
+
+    session[
+        "logged_in"
+    ] = True
+
+
+    session[
+        "username"
+    ] = username
+
+
+    session[
+        "suspicious_login"
+    ] = True
+
+
+    logger.warning(
+        "Valid credentials but suspicious "
+        "behavior detected for user: %s",
+        username
+    )
+
 
     return render_template(
 
         "login.html",
 
-        error="Invalid username or password",
+        error=(
+            "Valid credentials detected, "
+            "but suspicious login behavior was found."
+        ),
 
-        risk_level=risk_level,
+        risk_level=final_risk_level,
 
-        risk_score=risk_score,
+        risk_score=final_score,
 
-        explanation=explanation,
+        explanation=final_explanation,
 
         alert_result=alert_result
     )
 
 
-# =========================================================
+# ============================================================
 # DASHBOARD
-# =========================================================
+# ============================================================
 
-@app.route("/dashboard")
+@app.route(
+    "/dashboard"
+)
 def dashboard():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
         return redirect(
-            url_for("login")
+            url_for(
+                "login"
+            )
         )
 
-    return render_template(
-        "dashboard.html",
-        username=session.get("username")
+
+    username = session.get(
+        "username"
     )
 
 
-# =========================================================
-# LOGOUT
-# =========================================================
+    return render_template(
 
-@app.route("/logout")
+        "dashboard.html",
+
+        username=username
+    )
+
+
+# ============================================================
+# LOGOUT
+# ============================================================
+
+@app.route(
+    "/logout"
+)
 def logout():
 
     session.clear()
 
     return redirect(
-        url_for("login")
+        url_for(
+            "login"
+        )
     )
 
 
-# =========================================================
-# API - LOGIN EVENTS
-# =========================================================
+# ============================================================
+# API — EVENTS
+# ============================================================
 
-@app.route("/api/events")
+@app.route(
+    "/api/events",
+    methods=["GET"]
+)
 def api_events():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
+
+
+    limit = request.args.get(
+        "limit",
+        100,
+        type=int
+    )
+
 
     events = LoginEvent.query.order_by(
+
         LoginEvent.timestamp.desc()
-    ).limit(100).all()
 
-    return jsonify([
-        event.to_dict()
-        for event in events
-    ])
+    ).limit(
+        limit
+    ).all()
 
 
-# =========================================================
-# API - STATISTICS
-# =========================================================
+    return jsonify(
+        [
+            event_to_dict(event)
+            for event in events
+        ]
+    )
 
-@app.route("/api/stats")
+
+# ============================================================
+# API — STATS
+# ============================================================
+
+@app.route(
+    "/api/stats",
+    methods=["GET"]
+)
 def api_stats():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
+
 
     total = LoginEvent.query.count()
 
-    flagged = LoginEvent.query.filter_by(
-        is_anomalous=True
-    ).count()
-
-    high = LoginEvent.query.filter_by(
-        risk_level="High"
-    ).count()
-
-    critical = LoginEvent.query.filter_by(
-        risk_level="Critical"
-    ).count()
-
-    medium = LoginEvent.query.filter_by(
-        risk_level="Medium"
-    ).count()
-
-    low = LoginEvent.query.filter_by(
-        risk_level="Low"
-    ).count()
-
-    safe = LoginEvent.query.filter_by(
-        risk_level="Safe"
-    ).count()
 
     successful = LoginEvent.query.filter_by(
         login_success=True
     ).count()
 
+
     failed = LoginEvent.query.filter_by(
         login_success=False
     ).count()
+
+
+    anomalous = LoginEvent.query.filter_by(
+        is_anomalous=True
+    ).count()
+
+
+    safe = LoginEvent.query.filter_by(
+        risk_level="Safe"
+    ).count()
+
+
+    low = LoginEvent.query.filter_by(
+        risk_level="Low"
+    ).count()
+
+
+    medium = LoginEvent.query.filter_by(
+        risk_level="Medium"
+    ).count()
+
+
+    high = LoginEvent.query.filter_by(
+        risk_level="High"
+    ).count()
+
+
+    critical = LoginEvent.query.filter_by(
+        risk_level="Critical"
+    ).count()
+
+
+    by_risk = {
+
+        "Safe": safe,
+
+        "Low": low,
+
+        "Medium": medium,
+
+        "High": high,
+
+        "Critical": critical
+    }
+
 
     return jsonify({
 
         "total": total,
 
-        "flagged": flagged,
-
         "successful": successful,
 
         "failed": failed,
+
+        "anomalous": anomalous,
+
+        "flagged": anomalous,
+
+        "safe": safe,
+
+        "low": low,
+
+        "medium": medium,
 
         "high": high,
 
         "critical": critical,
 
-        "medium": medium,
-
-        "low": low,
-
-        "safe": safe,
-
-        "by_risk": {
-
-            "Safe": safe,
-
-            "Low": low,
-
-            "Medium": medium,
-
-            "High": high,
-
-            "Critical": critical
-
-        }
-
+        "by_risk": by_risk
     })
 
 
-# =========================================================
-# API - LIVE EVENTS
-# =========================================================
+# ============================================================
+# API — LIVE EVENT
+# ============================================================
 
-@app.route("/api/live")
+@app.route(
+    "/api/live",
+    methods=["GET"]
+)
 def api_live():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
 
-    current_time = datetime.utcnow()
 
-    one_minute_ago = (
-        current_time -
-        timedelta(seconds=60)
+    event = LoginEvent.query.order_by(
+
+        LoginEvent.timestamp.desc()
+
+    ).first()
+
+
+    if not event:
+
+        return jsonify(
+            {
+                "event": None
+            }
+        )
+
+
+    return jsonify(
+        event_to_dict(event)
     )
 
-    events = LoginEvent.query.filter(
-        LoginEvent.timestamp >= one_minute_ago
+
+# ============================================================
+# API — TRUSTED DEVICES
+# ============================================================
+
+@app.route(
+    "/api/trusted-devices",
+    methods=["GET"]
+)
+def api_trusted_devices():
+
+    if not session.get(
+        "logged_in"
+    ):
+
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
+
+
+    username = request.args.get(
+        "username"
+    )
+
+
+    if not username:
+
+        username = session.get(
+            "username"
+        )
+
+
+    devices = TrustedDevice.query.filter_by(
+
+        username=username
+
     ).order_by(
-        LoginEvent.timestamp.desc()
+
+        TrustedDevice.last_seen.desc()
+
     ).all()
 
-    return jsonify([
-        event.to_dict()
-        for event in events
-    ])
+
+    return jsonify(
+        [
+            device.to_dict()
+            for device in devices
+        ]
+    )
 
 
-# =========================================================
-# API - CLEAR EVENTS
-# =========================================================
+# ============================================================
+# API — INJECT DEMO EVENT
+# ============================================================
 
-@app.route("/api/clear", methods=["POST"])
-def api_clear():
-
-    if not session.get("logged_in"):
-
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
-    LoginEvent.query.delete()
-
-    db.session.commit()
-
-    failed_tracker.clear()
-
-    return jsonify({
-
-        "success": True,
-
-        "message": "All login events cleared."
-
-    })
-
-
-# =========================================================
-# API - TEST EVENT INJECTION
-# =========================================================
-
-@app.route("/api/inject", methods=["POST"])
+@app.route(
+    "/api/inject",
+    methods=["POST"]
+)
 def api_inject():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
+
 
     data = request.get_json(
         silent=True
     ) or {}
 
+
     username = data.get(
         "username",
-        "test_user"
+        "attacker"
     )
+
 
     ip_address = data.get(
         "ip_address",
         "8.8.8.8"
     )
 
+
     location = data.get(
         "location",
-        "Unknown"
+        "Unknown City"
     )
+
 
     device = data.get(
         "device",
-        "Unknown"
+        "Unknown Device"
     )
+
 
     login_success = data.get(
         "login_success",
         False
     )
 
+
     failed_attempts = int(
         data.get(
             "failed_attempts",
-            3
+            10
         )
     )
 
-    timestamp = datetime.utcnow()
 
-    # -----------------------------------------------------
-    # RUN ANOMALY ENGINE
-    # -----------------------------------------------------
+    timestamp = datetime.now()
 
-    result = detect_anomalies(
+
+    user_agent = data.get(
+        "user_agent",
+        "Demo User Agent"
+    )
+
+
+    # ========================================================
+    # EXISTING ANOMALY ENGINE
+    # ========================================================
+
+    anomaly_result = detect_anomalies(
 
         username=username,
 
@@ -729,11 +2008,184 @@ def api_inject():
         timestamp=timestamp
     )
 
-    # -----------------------------------------------------
-    # CREATE EVENT
-    # -----------------------------------------------------
 
-    event = LoginEvent(
+    # ========================================================
+    # BEHAVIORAL ANALYSIS
+    # ========================================================
+
+    behavioral_result = calculate_behavioral_risk(
+
+        username=username,
+
+        device=device,
+
+        user_agent=user_agent,
+
+        ip_address=ip_address,
+
+        location=location,
+
+        login_time=timestamp
+    )
+
+
+    anomaly_score = anomaly_result.get(
+        "risk_score",
+        anomaly_result.get(
+            "score",
+            0
+        )
+    )
+
+
+    behavioral_score = behavioral_result.get(
+        "score",
+        0
+    )
+
+
+    risk_score = max(
+        anomaly_score,
+        behavioral_score
+    )
+
+
+    # Failed attempts additional risk
+    if failed_attempts >= 5:
+
+        risk_score = min(
+            risk_score + 20,
+            100
+        )
+
+
+    # ========================================================
+    # RISK LEVEL
+    # ========================================================
+
+    if risk_score >= 81:
+
+        risk_level = "Critical"
+
+    elif risk_score >= 61:
+
+        risk_level = "High"
+
+    elif risk_score >= 31:
+
+        risk_level = "Medium"
+
+    elif risk_score >= 1:
+
+        risk_level = "Low"
+
+    else:
+
+        risk_level = "Safe"
+
+
+    # ========================================================
+    # COMBINE ANOMALIES
+    # ========================================================
+
+    anomaly_types = list(
+        anomaly_result.get(
+            "anomalies",
+            []
+        )
+    )
+
+
+    behavioral_reasons = []
+
+
+    if not behavioral_result.get(
+        "known_device",
+        True
+    ):
+
+        behavioral_reasons.append(
+            "new_trusted_device"
+        )
+
+
+    if not behavioral_result.get(
+        "known_ip",
+        True
+    ):
+
+        behavioral_reasons.append(
+            "new_ip"
+        )
+
+
+    if not behavioral_result.get(
+        "known_location",
+        True
+    ):
+
+        behavioral_reasons.append(
+            "new_location"
+        )
+
+
+    for item in behavioral_reasons:
+
+        if item not in anomaly_types:
+
+            anomaly_types.append(
+                item
+            )
+
+
+    # ========================================================
+    # EXPLANATION
+    # ========================================================
+
+    explanations = []
+
+
+    anomaly_explanation = anomaly_result.get(
+        "explanation",
+        ""
+    )
+
+
+    behavioral_explanation = behavioral_result.get(
+        "explanation",
+        ""
+    )
+
+
+    if anomaly_explanation:
+
+        explanations.append(
+            anomaly_explanation
+        )
+
+
+    if behavioral_explanation:
+
+        explanations.append(
+            behavioral_explanation
+        )
+
+
+    final_explanation = "; ".join(
+        explanations
+    )
+
+
+    is_anomalous = (
+        risk_level.upper()
+        not in [
+            "SAFE",
+            "LOW"
+        ]
+    )
+
+
+    event = create_event(
 
         username=username,
 
@@ -749,345 +2201,269 @@ def api_inject():
 
         failed_attempts=failed_attempts,
 
-        is_anomalous=result["is_anomalous"],
+        is_anomalous=is_anomalous,
 
-        risk_level=result["risk_level"],
+        risk_level=risk_level,
 
-        risk_score=result["score"],
+        risk_score=risk_score,
 
-        anomaly_types=",".join(
-            result["anomalies"]
-        ),
+        explanation=final_explanation,
 
-        explanation=result["explanation"]
-
+        anomaly_types=anomaly_types
     )
 
-    db.session.add(event)
 
-    db.session.commit()
+    alert_result = send_alert_if_required(
+        event
+    )
 
-    # -----------------------------------------------------
-    # ALERT
-    # -----------------------------------------------------
-
-    alert_result = {
-
-        "alert_triggered": False,
-
-        "email_sent": False,
-
-        "sms_sent": False
-
-    }
-
-    if result["risk_level"] in [
-        "High",
-        "Critical"
-    ]:
-
-        try:
-
-            alert_result = send_security_alert(
-
-                username=username,
-
-                ip_address=ip_address,
-
-                location=location,
-
-                risk_level=result["risk_level"],
-
-                risk_score=result["score"],
-
-                explanation=result["explanation"]
-
-            )
-
-        except Exception as e:
-
-            alert_result = {
-
-                "alert_triggered": True,
-
-                "email_sent": False,
-
-                "sms_sent": False,
-
-                "error": str(e)
-
-            }
 
     return jsonify({
 
         "success": True,
 
-        "event": event.to_dict(),
+        "event": event_to_dict(
+            event
+        ),
+
+        "risk_level": risk_level,
+
+        "risk_score": risk_score,
+
+        "explanation": final_explanation,
 
         "alert": alert_result
-
     })
 
 
-# =========================================================
-# 10-DAY PDF REPORT
-# =========================================================
+# ============================================================
+# API — CLEAR EVENTS
+# ============================================================
 
-@app.route("/generate-10-day-report")
-def generate_10_day_report_route():
+@app.route(
+    "/api/clear",
+    methods=["POST"]
+)
+def api_clear():
 
-    if not session.get("logged_in"):
+    if not session.get(
+        "logged_in"
+    ):
 
-        return redirect(
-            url_for("login")
-        )
+        return jsonify(
+            {
+                "error": "Unauthorized"
+            }
+        ), 401
 
-    # -----------------------------------------------------
-    # LAST 10 DAYS
-    # -----------------------------------------------------
 
-    end_date = datetime.utcnow()
+    LoginEvent.query.delete()
 
-    start_date = (
-        end_date -
-        timedelta(days=10)
-    )
+    db.session.commit()
 
-    events = LoginEvent.query.filter(
-
-        LoginEvent.timestamp >= start_date,
-
-        LoginEvent.timestamp <= end_date
-
-    ).order_by(
-
-        LoginEvent.timestamp.desc()
-
-    ).all()
-
-    # -----------------------------------------------------
-    # REPORT FOLDER
-    # -----------------------------------------------------
-
-    reports_folder = os.path.join(
-
-        app.root_path,
-
-        "reports"
-
-    )
-
-    os.makedirs(
-
-        reports_folder,
-
-        exist_ok=True
-
-    )
-
-    # -----------------------------------------------------
-    # FILE NAME
-    # -----------------------------------------------------
-
-    filename = (
-
-        "login_security_report_"
-
-        + datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-
-        + ".pdf"
-
-    )
-
-    filepath = os.path.join(
-
-        reports_folder,
-
-        filename
-
-    )
-
-    # -----------------------------------------------------
-    # GENERATE PDF
-    # -----------------------------------------------------
-
-    generate_10_day_report(
-
-        events,
-
-        filepath
-
-    )
-
-    # -----------------------------------------------------
-    # DOWNLOAD PDF
-    # -----------------------------------------------------
-
-    return send_file(
-
-        filepath,
-
-        as_attachment=True,
-
-        download_name=filename,
-
-        mimetype="application/pdf"
-
-    )
-
-
-# =========================================================
-# REPORT INFORMATION API
-# =========================================================
-
-@app.route("/api/report-info")
-def report_info():
-
-    if not session.get("logged_in"):
-
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
-    end_date = datetime.utcnow()
-
-    start_date = (
-        end_date -
-        timedelta(days=10)
-    )
-
-    events = LoginEvent.query.filter(
-
-        LoginEvent.timestamp >= start_date,
-
-        LoginEvent.timestamp <= end_date
-
-    ).all()
-
-    total = len(events)
-
-    successful = sum(
-
-        1
-        for event in events
-        if event.login_success
-
-    )
-
-    failed = total - successful
-
-    safe = sum(
-
-        1
-        for event in events
-        if event.risk_level == "Safe"
-
-    )
-
-    low = sum(
-
-        1
-        for event in events
-        if event.risk_level == "Low"
-
-    )
-
-    medium = sum(
-
-        1
-        for event in events
-        if event.risk_level == "Medium"
-
-    )
-
-    high = sum(
-
-        1
-        for event in events
-        if event.risk_level == "High"
-
-    )
-
-    critical = sum(
-
-        1
-        for event in events
-        if event.risk_level == "Critical"
-
-    )
 
     return jsonify({
 
-        "report_period_days": 10,
+        "success": True,
 
-        "start_date": start_date.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-
-        "end_date": end_date.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-
-        "total": total,
-
-        "successful": successful,
-
-        "failed": failed,
-
-        "safe": safe,
-
-        "low": low,
-
-        "medium": medium,
-
-        "high": high,
-
-        "critical": critical
-
+        "message":
+            "All login events cleared."
     })
 
 
-# =========================================================
+# ============================================================
 # HEALTH CHECK
-# =========================================================
+# ============================================================
 
-@app.route("/health")
+@app.route(
+    "/health"
+)
 def health():
 
     return jsonify({
 
-        "status": "running",
+        "status":
+            "running",
 
-        "service": "Login Anomaly Detection System",
+        "database":
+            "available",
 
-        "time": datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        "alert_engine":
+            (
+                "available"
+                if ALERT_ENGINE_AVAILABLE
+                else "unavailable"
+            ),
 
+        "trusted_device":
+            "enabled",
+
+        "behavioral_analysis":
+            "enabled"
     })
 
 
-# =========================================================
-# RUN APPLICATION
-# =========================================================
+# ============================================================
+# GENERATE 10-DAY REPORT
+# ============================================================
+
+@app.route(
+    "/generate-10-day-report"
+)
+def generate_10_day_report():
+
+    if not session.get(
+        "logged_in"
+    ):
+
+        return redirect(
+            url_for(
+                "login"
+            )
+        )
+
+
+    try:
+
+        from report_generator import (
+            generate_report
+        )
+
+
+        end_date = datetime.now()
+
+
+        start_date = (
+
+            end_date
+
+            -
+
+            timedelta(
+                days=10
+            )
+        )
+
+
+        events = LoginEvent.query.filter(
+
+            LoginEvent.timestamp >= start_date,
+
+            LoginEvent.timestamp <= end_date
+
+        ).order_by(
+
+            LoginEvent.timestamp.asc()
+
+        ).all()
+
+
+        report_path = generate_report(
+
+            events,
+
+            start_date,
+
+            end_date
+        )
+
+
+        return send_file(
+
+            report_path,
+
+            as_attachment=True
+        )
+
+
+    except Exception as error:
+
+        logger.exception(
+            "Report generation failed: %s",
+            error
+        )
+
+
+        return jsonify({
+
+            "error":
+                "Report generation failed",
+
+            "details":
+                str(error)
+
+        }), 500
+
+
+# ============================================================
+# APPLICATION START
+# ============================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.getenv(
-            "PORT",
-            5000
+    print("=" * 60)
+
+    print(
+        "REAL-TIME LOGIN ANOMALY DETECTION SYSTEM"
+    )
+
+    print("=" * 60)
+
+    print(
+        "Existing Anomaly Engine  : ENABLED"
+    )
+
+    print(
+        "Explanation Engine       : ENABLED"
+    )
+
+    print(
+        "Trusted Device Detection : ENABLED"
+    )
+
+    print(
+        "Behavioral Analysis      : ENABLED"
+    )
+
+    print(
+        "Device Fingerprinting    : ENABLED"
+    )
+
+    print(
+        "IP Recognition           : ENABLED"
+    )
+
+    print(
+        "Time Analysis            : ENABLED"
+    )
+
+    print(
+        "Email Alerts             : ENABLED"
+    )
+
+    print(
+        "SMS Demo Alerts          : ENABLED"
+    )
+
+    print(
+
+        "Alert Engine             :",
+
+        (
+            "AVAILABLE"
+            if ALERT_ENGINE_AVAILABLE
+            else "UNAVAILABLE"
         )
     )
+
+    print("=" * 60)
+
 
     app.run(
 
         host="0.0.0.0",
 
-        port=port,
+        port=5000,
 
         debug=True
-
     )

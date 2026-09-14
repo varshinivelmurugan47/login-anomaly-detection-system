@@ -1,312 +1,406 @@
 # ============================================================
-# alert_engine.py
-# Email Alert + Simulated SMS Alert
-# Login Anomaly Detection System
+# alert_engine.py — Email + Simulated SMS Alerts
 # ============================================================
 
 import os
-import smtplib
-from email.message import EmailMessage
+import logging
 from datetime import datetime
 
-
-# ============================================================
-# EMAIL CONFIGURATION
-# ============================================================
-
-# Email address that will RECEIVE the security alert
-ALERT_EMAIL = os.getenv("ALERT_EMAIL")
-
-# Gmail address used to SEND the alert
-SMTP_USER = os.getenv("SMTP_USER")
-
-# Gmail App Password
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
+import resend
 
 
-# Gmail SMTP configuration
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-
-
-# ============================================================
-# SMS CONFIGURATION
-# ============================================================
-
-# This is a DEMO SMS.
-# No real SMS is sent by this version.
-
-ALERT_PHONE = os.getenv(
-    "ALERT_PHONE",
-    "Demo Phone"
+logging.basicConfig(
+    level=logging.INFO
 )
 
 
 # ============================================================
-# EMAIL CONFIGURATION CHECK
-# ============================================================
-
-def email_configured():
-    """
-    Check whether all required email settings
-    are configured.
-    """
-
-    if not ALERT_EMAIL:
-        return False
-
-    if not SMTP_USER:
-        return False
-
-    if not EMAIL_APP_PASSWORD:
-        return False
-
-    return True
-
-
-# ============================================================
-# SEND EMAIL ALERT
+# EMAIL ALERT
 # ============================================================
 
 def send_email_alert(
     username,
     ip_address,
     location,
+    device,
     risk_level,
     risk_score,
-    explanation=""
+    explanation,
+    timestamp
 ):
-    """
-    Send a security alert through Gmail SMTP.
 
-    Returns:
-        True  -> email sent successfully
-        False -> email failed
-    """
-
-    # --------------------------------------------------------
-    # Check configuration
-    # --------------------------------------------------------
-
-    if not ALERT_EMAIL:
-        print("ERROR: ALERT_EMAIL is not configured.")
-        return False
-
-    if not SMTP_USER:
-        print("ERROR: SMTP_USER is not configured.")
-        return False
-
-    if not EMAIL_APP_PASSWORD:
-        print("ERROR: EMAIL_APP_PASSWORD is not configured.")
-        return False
-
-    # --------------------------------------------------------
-    # Create email
-    # --------------------------------------------------------
-
-    message = EmailMessage()
-
-    message["Subject"] = (
-        f"[SECURITY ALERT] "
-        f"{risk_level.upper()} Login Detected"
+    api_key = os.getenv(
+        "RESEND_API_KEY"
     )
 
-    message["From"] = SMTP_USER
-    message["To"] = ALERT_EMAIL
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
+    alert_email = os.getenv(
+        "ALERT_EMAIL"
     )
 
-    email_body = f"""
-LOGIN ANOMALY DETECTION SYSTEM
-========================================
+    email_from = os.getenv(
+        "EMAIL_FROM",
+        "Login Security System <onboarding@resend.dev>"
+    )
 
-SECURITY ALERT
 
-Risk Level : {risk_level}
-Risk Score : {risk_score}
+    if not api_key or not alert_email:
 
-LOGIN DETAILS
-----------------------------------------
-Username   : {username}
-IP Address : {ip_address}
-Location   : {location}
-Time       : {timestamp}
+        logging.error(
+            "Email configuration is missing."
+        )
 
-EXPLANATION
-----------------------------------------
-{
-    explanation
-    if explanation
-    else
-    "Suspicious login activity detected."
-}
+        return False
 
-ACTION REQUIRED
-----------------------------------------
-Please verify this login activity.
 
-If this login was not performed by you,
-take appropriate security action.
+    resend.api_key = api_key
 
-This alert was generated automatically
-by the Login Anomaly Detection System.
 
-========================================
-"""
+    subject = (
+        f"Security Alert: "
+        f"{risk_level} Login Detected"
+    )
 
-    message.set_content(email_body)
 
-    # --------------------------------------------------------
-    # Connect to Gmail SMTP
-    # --------------------------------------------------------
+    html_body = f"""
+    <html>
+    <body style="font-family:Arial,sans-serif;">
+
+        <h2>🚨 Login Security Alert</h2>
+
+        <p>
+            A suspicious login was detected by the
+            <b>Real-Time Login Anomaly Detection System</b>.
+        </p>
+
+        <table
+            border="1"
+            cellpadding="8"
+            cellspacing="0"
+            style="border-collapse:collapse;"
+        >
+
+            <tr>
+                <td><b>Username</b></td>
+                <td>{username}</td>
+            </tr>
+
+            <tr>
+                <td><b>IP Address</b></td>
+                <td>{ip_address}</td>
+            </tr>
+
+            <tr>
+                <td><b>Location</b></td>
+                <td>{location}</td>
+            </tr>
+
+            <tr>
+                <td><b>Device</b></td>
+                <td>{device}</td>
+            </tr>
+
+            <tr>
+                <td><b>Timestamp</b></td>
+                <td>{timestamp}</td>
+            </tr>
+
+            <tr>
+                <td><b>Risk Level</b></td>
+                <td>{risk_level}</td>
+            </tr>
+
+            <tr>
+                <td><b>Risk Score</b></td>
+                <td>{risk_score}</td>
+            </tr>
+
+        </table>
+
+        <h3>Explanation</h3>
+
+        <p>
+            {explanation}
+        </p>
+
+        <p>
+            If you did not perform this login,
+            secure your account immediately.
+        </p>
+
+        <hr>
+
+        <p>
+            This alert was generated automatically by the
+            Login Anomaly Detection System.
+        </p>
+
+    </body>
+    </html>
+    """
+
 
     try:
 
-        print("\nSending email alert...")
+        response = resend.Emails.send({
 
-        with smtplib.SMTP(
-            SMTP_SERVER,
-            SMTP_PORT,
-            timeout=15
-        ) as server:
+            "from": email_from,
 
-            # Start TLS encryption
-            server.starttls()
+            "to": [alert_email],
 
-            # Login to Gmail
-            server.login(
-                SMTP_USER,
-                EMAIL_APP_PASSWORD
-            )
+            "subject": subject,
 
-            # Send email
-            server.send_message(message)
+            "html": html_body
+        })
 
-        print("EMAIL ALERT: SENT SUCCESSFULLY")
+
+        logging.info(
+            "EMAIL ALERT SENT SUCCESSFULLY"
+        )
+
+        logging.info(
+            "Resend response: %s",
+            response
+        )
 
         return True
 
-    # --------------------------------------------------------
-    # Authentication error
-    # --------------------------------------------------------
 
-    except smtplib.SMTPAuthenticationError:
+    except Exception as error:
 
-        print(
-            "ERROR: Gmail authentication failed."
-        )
-
-        print(
-            "Check SMTP_USER and EMAIL_APP_PASSWORD."
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # Connection error
-    # --------------------------------------------------------
-
-    except smtplib.SMTPConnectError:
-
-        print(
-            "ERROR: Could not connect to Gmail SMTP server."
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # Timeout
-    # --------------------------------------------------------
-
-    except TimeoutError:
-
-        print(
-            "ERROR: Gmail SMTP connection timed out."
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # Other error
-    # --------------------------------------------------------
-
-    except Exception as e:
-
-        print(
-            f"ERROR: Email sending failed: {e}"
+        logging.exception(
+            "EMAIL ALERT FAILED: %s",
+            error
         )
 
         return False
 
 
 # ============================================================
-# SIMULATED SMS ALERT
+# SIMULATED SMS
 # ============================================================
 
 def send_sms_alert(
     username,
-    ip_address,
-    location,
     risk_level,
     risk_score
 ):
+
     """
-    Simulated SMS alert for project demonstration.
+    SMS demonstration mode.
 
-    IMPORTANT:
-    This function DOES NOT send a real SMS.
+    No paid SMS gateway is used.
 
-    It displays the SMS notification in the
-    terminal to demonstrate the alert workflow.
-
-    Returns:
-        True -> simulation completed
+    The notification is:
+    1. Displayed in terminal
+    2. Saved to sms_demo.log
     """
 
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
+
+    alert_phone = os.getenv(
+        "ALERT_PHONE",
+        "+91-XXXXXXXXXX"
     )
 
-    # --------------------------------------------------------
-    # SMS Header
-    # --------------------------------------------------------
 
-    print("\n")
+    message = (
+
+        f"SECURITY ALERT: "
+        f"{risk_level} login detected. "
+
+        f"User: {username}. "
+
+        f"Risk Score: {risk_score}. "
+
+        f"Check your security dashboard."
+    )
+
+
+    print()
 
     print("=" * 60)
 
     print(
-        "             SIMULATED SMS ALERT"
+        "SMS ALERT - DEMO MODE"
     )
 
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # SMS information
-    # --------------------------------------------------------
-
     print(
-        "SMS STATUS : SENT (DEMO)"
+        f"To      : {alert_phone}"
     )
 
     print(
-        f"Recipient  : {ALERT_PHONE}"
+        f"Message : {message}"
     )
 
     print(
-        f"Time       : {timestamp}"
+        "Status  : SIMULATED - "
+        "No paid SMS service used"
     )
 
-    print("-" * 60)
+    print("=" * 60)
 
-    # --------------------------------------------------------
-    # Login information
-    # --------------------------------------------------------
+    print()
+
+
+    try:
+
+        with open(
+            "sms_demo.log",
+            "a"
+        ) as file:
+
+            file.write(
+
+                f"\n[{datetime.now()}]\n"
+
+                f"To: {alert_phone}\n"
+
+                f"Message: {message}\n"
+
+                f"Status: SIMULATED SMS\n"
+
+                f"{'-' * 50}\n"
+            )
+
+
+        logging.info(
+            "SMS demo notification recorded."
+        )
+
+
+    except Exception as error:
+
+        logging.warning(
+            "Could not write SMS demo log: %s",
+            error
+        )
+
+
+    return True
+
+
+# ============================================================
+# MAIN SECURITY ALERT
+# ============================================================
+
+def send_security_alert(event):
+
+    if event is None:
+
+        logging.error(
+            "Security alert received an empty event."
+        )
+
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+    username = getattr(
+        event,
+        "username",
+        "Unknown"
+    )
+
+    ip_address = getattr(
+        event,
+        "ip_address",
+        "Unknown"
+    )
+
+    location = getattr(
+        event,
+        "location",
+        "Unknown"
+    )
+
+    device = getattr(
+        event,
+        "device",
+        "Unknown"
+    )
+
+    risk_level = getattr(
+        event,
+        "risk_level",
+        "LOW"
+    )
+
+    risk_score = getattr(
+        event,
+        "risk_score",
+        0
+    )
+
+    explanation = getattr(
+        event,
+        "explanation",
+        "Suspicious login activity detected."
+    )
+
+    timestamp = getattr(
+        event,
+        "timestamp",
+        datetime.now()
+    )
+
+
+    risk_level = str(
+        risk_level
+    ).strip().upper()
+
+
+    # ========================================================
+    # ONLY HIGH / CRITICAL
+    # ========================================================
+
+    if risk_level not in [
+        "HIGH",
+        "CRITICAL"
+    ]:
+
+        logging.info(
+            "No security alert required. "
+            "Risk level: %s",
+            risk_level
+        )
+
+        return {
+
+            "email_sent": False,
+
+            "sms_sent": False
+        }
+
+
+    # ========================================================
+    # DISPLAY ALERT
+    # ========================================================
+
+    print()
+
+    print("=" * 60)
 
     print(
-        f"User       : {username}"
+        "SECURITY ALERT TRIGGERED"
+    )
+
+    print("=" * 60)
+
+    print(
+        f"Risk Level : {risk_level}"
+    )
+
+    print(
+        f"Risk Score : {risk_score}"
+    )
+
+    print(
+        f"Username   : {username}"
     )
 
     print(
@@ -318,234 +412,110 @@ def send_sms_alert(
     )
 
     print(
-        f"Risk Level : {risk_level}"
+        f"Device     : {device}"
     )
 
     print(
-        f"Risk Score : {risk_score}"
+        f"Explanation: {explanation}"
     )
 
-    print("-" * 60)
+    print("=" * 60)
 
-    # --------------------------------------------------------
-    # SMS message
-    # --------------------------------------------------------
+
+    # ========================================================
+    # EMAIL
+    # ========================================================
+
+    print()
 
     print(
-        "SMS MESSAGE"
+        "[EMAIL] Sending security alert..."
     )
 
-    print("-" * 60)
+
+    email_sent = send_email_alert(
+
+        username,
+
+        ip_address,
+
+        location,
+
+        device,
+
+        risk_level,
+
+        risk_score,
+
+        explanation,
+
+        timestamp
+    )
+
+
+    if email_sent:
+
+        print(
+            "[EMAIL] SUCCESS"
+        )
+
+    else:
+
+        print(
+            "[EMAIL] FAILED"
+        )
+
+
+    # ========================================================
+    # SIMULATED SMS
+    # ========================================================
+
+    print()
 
     print(
-        "HIGH RISK LOGIN DETECTED!"
+        "[SMS] Starting demo SMS notification..."
     )
 
-    print(
-        f"User: {username}"
+
+    sms_sent = send_sms_alert(
+
+        username,
+
+        risk_level,
+
+        risk_score
     )
 
-    print(
-        f"Location: {location}"
-    )
 
-    print(
-        f"Risk Level: {risk_level}"
-    )
+    if sms_sent:
 
-    print(
-        "Please verify your account."
-    )
+        print(
+            "[SMS] DEMO SUCCESS"
+        )
 
-    # --------------------------------------------------------
-    # Finish
-    # --------------------------------------------------------
+    else:
+
+        print(
+            "[SMS] DEMO FAILED"
+        )
+
+
+    print()
 
     print("=" * 60)
 
     print(
-        "SMS SIMULATION COMPLETED"
+        "ALERT PROCESS COMPLETED"
     )
 
     print("=" * 60)
 
     print()
 
-    return True
-
-
-# ============================================================
-# MAIN SECURITY ALERT FUNCTION
-# ============================================================
-
-def send_security_alert(
-    username,
-    ip_address,
-    location,
-    risk_level,
-    risk_score,
-    explanation=""
-):
-    """
-    Main security alert function.
-
-    HIGH and CRITICAL:
-        -> Email alert
-        -> Simulated SMS alert
-
-    LOW and MEDIUM:
-        -> No alert
-
-    SAFE:
-        -> No alert
-    """
-
-    # --------------------------------------------------------
-    # Normalize risk level
-    # --------------------------------------------------------
-
-    risk_level = str(
-        risk_level
-    ).strip().capitalize()
-
-    # --------------------------------------------------------
-    # Only HIGH and CRITICAL trigger alerts
-    # --------------------------------------------------------
-
-    if risk_level not in [
-        "High",
-        "Critical"
-    ]:
-
-        print(
-            f"Risk level is {risk_level}. "
-            "No security alert required."
-        )
-
-        return {
-            "alert_triggered": False,
-            "email_sent": False,
-            "sms_sent": False
-        }
-
-    # ========================================================
-    # HIGH / CRITICAL RISK
-    # ========================================================
-
-    print("\n" + "=" * 60)
-
-    print(
-        f"{risk_level.upper()} RISK DETECTED "
-        "- SENDING EMAIL AND SMS ALERT."
-    )
-
-    print("=" * 60)
-
-    # ========================================================
-    # EMAIL ALERT
-    # ========================================================
-
-    email_sent = send_email_alert(
-        username=username,
-        ip_address=ip_address,
-        location=location,
-        risk_level=risk_level,
-        risk_score=risk_score,
-        explanation=explanation
-    )
-
-    # ========================================================
-    # SMS ALERT
-    # ========================================================
-
-    sms_sent = send_sms_alert(
-        username=username,
-        ip_address=ip_address,
-        location=location,
-        risk_level=risk_level,
-        risk_score=risk_score
-    )
-
-    # ========================================================
-    # ALERT SUMMARY
-    # ========================================================
-
-    print("\n" + "=" * 60)
-
-    print(
-        "SECURITY ALERT SUMMARY"
-    )
-
-    print("=" * 60)
-
-    print(
-        f"Email Alert : "
-        f"{'SENT' if email_sent else 'FAILED'}"
-    )
-
-    print(
-        f"SMS Alert   : "
-        f"{'SENT (DEMO)' if sms_sent else 'FAILED'}"
-    )
-
-    print("=" * 60)
-
-    # ========================================================
-    # RETURN RESULT
-    # ========================================================
 
     return {
-        "alert_triggered": True,
+
         "email_sent": email_sent,
+
         "sms_sent": sms_sent
     }
-
-
-# ============================================================
-# TEST ALERT ENGINE
-# ============================================================
-
-if __name__ == "__main__":
-
-    print("=" * 60)
-
-    print(
-        "LOGIN ANOMALY DETECTION"
-    )
-
-    print(
-        "ALERT ENGINE TEST"
-    )
-
-    print("=" * 60)
-
-    # --------------------------------------------------------
-    # Test HIGH risk event
-    # --------------------------------------------------------
-
-    result = send_security_alert(
-
-        username="admin",
-
-        ip_address="8.8.8.8",
-
-        location="Unknown",
-
-        risk_level="High",
-
-        risk_score=85,
-
-        explanation=(
-            "Multiple failed login attempts detected "
-            "from an unusual location."
-        )
-
-    )
-
-    # --------------------------------------------------------
-    # Display result
-    # --------------------------------------------------------
-
-    print("\nFinal Result:")
-
-    print(result)
